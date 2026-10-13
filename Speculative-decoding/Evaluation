@@ -1,0 +1,129 @@
+# Evaluation: Speculative Decoding
+
+Both solutions are correct and pass the full test suite (`python -m unittest tests -v`: 25 passed, 1 skipped by design). This document analyses correctness, complexity, readability, maintainability, and edge cases, and lists the failure modes to check when grading AI-generated attempts at this problem.
+
+## 1. Correctness
+
+### Why the algorithm preserves the target distribution
+
+Let `p` be the target and `q` the draft distribution at one position. A token `x` is drafted with probability `q(x)` and accepted with probability `min(1, p(x)/q(x))`. On rejection, a replacement is drawn from `norm(max(0, p - q))`.
+
+Probability that the position emits `x`:
+
+```
+P(x) = q(x) * min(1, p(x)/q(x))                      (drafted and accepted)
+     + (1 - sum_y min(p(y), q(y))) * max(0, p(x) - q(x)) / sum_y max(0, p(y) - q(y))
+     = min(p(x), q(x)) + max(0, p(x) - q(x))          (the two sums are equal)
+     = p(x)
+```
+
+The rejection probability `1 - sum_y min(p,q)` equals `sum_y max(0, p - q)`, so the normalizer cancels. By induction over positions, conditioned on an accepted prefix the next token is distributed as `p(. | prefix)`, so the joint distribution equals ordinary autoregressive sampling. The bonus token after a fully accepted round is drawn from the target's distribution at the next position, which is also exact.
+
+### Empirical verification
+
+Test: 60,000 sampled 3-token continuations (vocabulary 4, `k = 3`) compared with the exact joint distribution (64 sequences, pooled to 56 cells, df = 55).
+
+| Implementation | Chi-square | Critical value (p = 0.001) | Result |
+|---|---|---|---|
+| Solution.py | 49.2 | 93.2 | Pass |
+| AlternativeSolution.py | 49.9 | 93.2 | Pass |
+| Mutant: resample from `p` on rejection | 13,908.1 | 93.2 | **Fails by a wide margin** |
+
+The mutant is a realistic mistake that produces plausible-looking text, so the test suite is sensitive to the most likely bug. Seeds are fixed, so results are reproducible. With arbitrary seeds a correct implementation would fail about 0.1% of the time.
+
+### Observed vs. theoretical throughput
+
+With average acceptance probability `alpha = sum_y min(p(y), q(y))` and `k` drafts, the expected tokens emitted per round is `(1 - alpha^(k+1)) / (1 - alpha)`. Measured over 300-token generations, 50 seeds each (`alpha` along the target path was 0.566 for the toy models):
+
+| k | Theory (tokens/round) | Solution.py | AlternativeSolution.py |
+|---|---|---|---|
+| 1 | 1.57 | 1.55 | 1.55 |
+| 2 | 1.89 | 1.88 | 1.88 |
+| 4 | 2.17 | 2.18 | 2.17 |
+| 8 | 2.29 | 2.29 | 2.31 |
+
+Identical models with `k = 4` gave exactly 5.0 tokens per round (60 rounds for 300 tokens), the theoretical maximum of `k + 1`.
+
+Note the diminishing returns: going from `k = 4` to `k = 8` adds about 0.1 tokens per round while doubling draft cost. The best `k` depends on the draft/target cost ratio.
+
+## 2. Complexity
+
+Let `V` be the vocabulary size, `N` the tokens generated, `L` the context length, and `R` the number of rounds (about `N / tokens_per_round`).
+
+| Aspect | Solution.py | AlternativeSolution.py |
+|---|---|---|
+| Per-round model calls | up to `k` draft + `k + 1` target | same |
+| Per-round own work | `O(k * V)` validation and sampling | `O(k * V)` (extra `O(V)` prefix sums per sample) |
+| Sampling one token | `O(V)` scan | `O(V)` build + `O(log V)` lookup |
+| Total own work | `O(R * k * V)` | `O(R * k * V)` |
+| Extra memory | `O(k * V)` stored distributions | `O(k * V)` plus the mask and uniforms `O(k)` |
+| Context copying | `O(L)` per target call | `O(L)` per target call |
+
+Both are dominated by model cost in a real system. The relevant metric is **target rounds**, not own-code time. The `O(L)` list copy per target call is a toy-model artifact. A real implementation would reuse a KV cache and pass only new tokens.
+
+Measured wall time for the 60,000-sample exactness test: 2.2 s (Solution) vs 2.7 s (Alternative). The Alternative is slower in Python because it builds a prefix-sum list for every sample and draws uniforms for positions that are discarded after the first rejection, so bisect's `O(log V)` lookup does not pay off at `V = 4`. At large `V`, the lookup advantage grows, but building prefix sums still costs `O(V)`.
+
+## 3. Readability
+
+**Solution.py**
+- One main function, easy to trace top to bottom: draft, verify, accept/reject, bonus.
+- `for ... else` is idiomatic for "no rejection happened" but unfamiliar to many readers. It deserves the comment it has.
+- Division-free acceptance check (`u * q[x] < p[x]`) is correct but needs the comment explaining why `q[x] > 0`.
+
+**AlternativeSolution.py**
+- A `_run_round` method with an immutable `RoundResult` reads cleanly and is easier to unit test.
+- Precomputing the accept mask then scanning for the first `False` reads declaratively, but separates "decide" from "act" across two steps, which is slightly less direct.
+- A class adds ceremony for a function that has no real state beyond configuration.
+
+## 4. Maintainability
+
+- **Both:** Validation is centralised in one helper, so changing the tolerance or adding checks is a one-line edit. The `Stats` dataclass is duplicated across files for self-containment. In one codebase it would be shared.
+- **Solution.py** is the smaller change surface for tweaks like temperature scaling. **AlternativeSolution.py** is the better base if you later add features like tree-based drafting, adaptive `k`, or logging, since `_run_round` is a natural seam.
+- Neither depends on global state, which keeps tests independent.
+- The statistical test depends on fixed seeds. If the sampling order changes, the seed may need updating.
+
+## 5. Edge cases
+
+| Case | Handling | Verified by |
+|---|---|---|
+| Remaining budget smaller than `k + 1` | `gamma = min(k, remaining - 1)`, so a round can never overshoot. When `gamma = 0`, it samples directly from the target. | `test_never_exceeds_budget_and_hits_it_exactly_without_eos` |
+| `max_new_tokens = 0` | Returns `[]` with zero rounds | same |
+| EOS accepted, corrected, or bonus | Emitted as the last token and stops, including mid-draft | `test_eos_terminates_and_is_last_token` |
+| Disjoint supports | Every draft rejected, residual equals `p` | `test_disjoint_support_always_rejects_but_stays_correct` |
+| Zero-probability tokens | Samplers never return zero-weight indices (even under float rounding) | `test_never_emits_zero_probability_tokens` |
+| Identical models | Residual vanishes, so it never triggers. A fallback to `p` guards float noise. | `test_identical_models_accept_everything` |
+| Point-mass models | Deterministic output | `test_point_mass_models` |
+| Malformed distributions / bad arguments | `ValueError` | two validation tests |
+| Prompt mutation | Prompt is copied | `test_does_not_mutate_prompt` |
+
+**Known limitations (untested or by design):**
+- Very small probabilities (below about `1e-12`) in the residual are treated as zero, which can introduce an error of that magnitude.
+- Models returning NumPy arrays or tensors were not tested, and per-element conversion costs were not measured.
+- Timing measures only the toy models. No claim is made about real-world speedup.
+
+## 6. Failure modes to check in AI-generated attempts
+
+These are the mistakes this problem is designed to expose. They were not collected from specific models. They are the natural errors in this algorithm.
+
+1. **Resampling from `p` on rejection** instead of the residual `norm(max(0, p - q))`. Produces fluent output with a measurably biased distribution (chi-square about 13,900 vs about 93 critical in this suite).
+2. **Using `min(1, q/p)`** (ratio inverted).
+3. **Greedy verification** (accept if the target's argmax equals the draft token). That is only valid for greedy decoding, not for sampling.
+4. **Forgetting the bonus token**, which wastes the free target distribution after a fully accepted round.
+5. **Emitting a bonus after a rejection**, or continuing to verify later drafted tokens after the first rejection.
+6. **Overshooting `max_new_tokens`** when `k + 1 > remaining`.
+7. **Dividing by `q[x]` without a guard**, risking division by zero or accepting with `p/0`.
+8. **Unnormalized residual sampling** that assumes the residual sums to 1.
+9. **Returning tokens after EOS**, or not stopping on a corrected or bonus EOS.
+10. **Mutating the caller's prompt**, or sharing the draft scratch list with the output.
+11. **Misreporting `acceptance_rate`.** Here it is `accepted / drafted`, and `drafted` includes tokens drafted after the first rejection that were thrown away. This is why the measured rate falls as `k` grows (0.555 at `k = 1` to 0.164 at `k = 8`) even though throughput rises. Tokens per round is the more honest efficiency metric.
+
+## 7. Verdict
+
+| Criterion | Solution.py | AlternativeSolution.py |
+|---|---|---|
+| Correctness | Excellent | Excellent |
+| Efficiency (measured) | Slightly faster | Slightly slower |
+| Readability | Excellent | Good |
+| Maintainability | Good | Excellent |
+
+**Recommendation:** use `Solution.py` for a compact reference. Use `AlternativeSolution.py` as the base for extensions.
